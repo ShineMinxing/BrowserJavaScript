@@ -1,11 +1,12 @@
 // ==UserScript==
-// @name         Bilibili Follow Page - Last Upload Time (iframe)
+// @name         Bilibili Follow Page - Last Upload Time (iframe+cache+risk)
 // @namespace    https://github.com/ShineMinxing/BrowserJavaScript
-// @version      1.0.0
+// @version      1.2.0
 // @author       ShineMinxing
-// @description  在 B站关注页（/relation/follow）下方显示每个关注UP主最近一次投稿的时间。
+// @description  在 B站关注页（/relation/follow）下方显示每个关注UP主最近一次投稿的时间（iframe 版，带本地缓存、解析失败重试与风险识别）。
 // @description:zh-CN 在 B站关注页（/relation/follow）下方显示每个关注UP主最近一次投稿的时间。
 //               通过隐藏 iframe 顺序打开各UP的 /upload/video 页面，从页面 DOM 中解析投稿时间，避免接口风控与 CORS 限制。
+//               使用 localStorage + 运行时缓存避免重复访问，同步检测 412 风控页面，触发后停止进一步请求。
 // @match        https://space.bilibili.com/*/relation/follow*
 // @run-at       document-end
 // @grant        none
@@ -28,13 +29,16 @@
   // 是否输出调试日志到控制台（F12 -> Console）
   const DEBUG = true;
 
+  // 本地持久缓存 key（只保存“成功解析”的时间戳）
+  const LS_KEY = 'biliLastVideoIframeCache_v1';
+
   /**
    * ========================= 顶部调试条 =========================
    * 仅作为脚本运行状态与简单统计的可视化提示。
    */
 
   const banner = document.createElement('div');
-  banner.textContent = '【LastVideo iframe v1.0】';
+  banner.textContent = '【LastVideo iframe v1.2】';
   Object.assign(banner.style, {
     position: 'fixed',
     top: '0',
@@ -70,7 +74,6 @@
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  // 将时间戳转换为“xx分钟前 / xx天前 / xx个月前”等字符串
   function formatDiff(ts) {
     if (!ts) return '无投稿记录';
     let diff = Date.now() - ts;
@@ -155,16 +158,85 @@
   }
 
   /**
-   * ========================= iframe 管理 =========================
-   *
-   * 核心思路：
-   *  - 在同域（space.bilibili.com）下创建一个隐藏 iframe。
-   *  - 依次将 iframe.src 设置为各个 UP 的 /upload/video 页面。
-   *  - 等页面 onload + IFRAME_RENDER_WAIT 毫秒后，从 iframe 的 DOM 中读取视频卡片的时间字段。
-   *  - 为了防止并发 & 过快请求导致风控，使用队列方式顺序加载，并在两个 UP 之间插入 LOAD_INTERVAL 间隔。
+   * 风控页面识别：
+   * 典型 B 站 412 风控页文案：
+   *   - "错误号: 412"
+   *   - "由于触发哔哩哔哩安全风控策略，该次访问请求被拒绝。"
+   *   - "The request was rejected because of the bilibili security control policy."
+   */
+  function isRiskBlockedDoc(doc) {
+    try {
+      const body = doc && doc.body;
+      if (!body) return false;
+      const text = (body.innerText || body.textContent || '').trim();
+      if (!text) return false;
+      if (text.includes('错误号') && text.includes('412')) return true;
+      if (text.includes('安全风控策略')) return true;
+      if (text.includes('security control policy')) return true;
+      return false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
+   * ========================= 缓存管理 =========================
    */
 
-  // 隐藏 iframe，只用于加载各个 UP 的 upload/video 页面
+  // 运行时缓存：mid -> { ts: number|null, why: string|null }
+  const runtimeCache = new Map();
+
+  function loadPersistentCache() {
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      if (!raw) return {};
+      const obj = JSON.parse(raw);
+      if (obj && typeof obj === 'object') return obj;
+      return {};
+    } catch (e) {
+      log('解析本地缓存失败', e);
+      return {};
+    }
+  }
+
+  function savePersistentCache(obj) {
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify(obj));
+    } catch (e) {
+      log('写入本地缓存失败', e);
+    }
+  }
+
+  // 持久缓存：mid -> ts(毫秒)
+  const persistentCache = loadPersistentCache();
+
+  // 从两级缓存中读取数据
+  function getCached(mid) {
+    if (persistentCache[mid]) {
+      return { ts: persistentCache[mid], why: null, source: 'persistent' };
+    }
+    if (runtimeCache.has(mid)) {
+      const r = runtimeCache.get(mid);
+      return { ts: r.ts, why: r.why, source: 'runtime' };
+    }
+    return null;
+  }
+
+  // 写运行时缓存
+  function setRuntimeCache(mid, ts, why) {
+    runtimeCache.set(mid, { ts, why: why || null });
+  }
+
+  // 写持久缓存（只存成功 ts）
+  function setPersistentCache(mid, ts) {
+    persistentCache[mid] = ts;
+    savePersistentCache(persistentCache);
+  }
+
+  /**
+   * ========================= iframe 管理 =========================
+   */
+
   const iframe = document.createElement('iframe');
   iframe.style.position = 'fixed';
   iframe.style.bottom = '0';
@@ -173,24 +245,67 @@
   iframe.style.height = '0';
   iframe.style.border = 'none';
   iframe.style.visibility = 'hidden';
-  // 不设置 sandbox，保持与顶层页面相同的权限，方便读取 contentDocument
   document.body.appendChild(iframe);
 
-  let iframeBusy = false; // 简单的“锁”，保证同一时间只处理一个 mid
-  const resultCache = new Map(); // mid -> { ts: number|null, why: string|null }
+  let iframeBusy = false;         // 简单“锁”：保证同一时间只处理一个 mid
+  let riskBlocked = false;        // 一旦检测到风险页，置为 true，后续不再请求
+
+  // 可重试错误：解析失败、超时、iframe onerror、页面加载失败
+  const RETRYABLE_ERRORS = new Set([
+    'parse_failed',
+    'iframe_timeout',
+    'iframe_onerror',
+    'load_error',
+  ]);
 
   /**
    * 加载单个 UP 的 upload/video 页面，并解析出最近一次投稿时间。
+   * 会优先使用本地缓存（持久 + 运行时），只有在没有缓存且未被标记 riskBlocked 时，才真正发起 iframe 加载。
+   * 对于“解析失败/超时”这类软错误，会在下一次扫描时重试。
    * @param {string} mid - UP 主的 mid
-   * @returns {Promise<{ts: number|null, why: string|null}>}
+   * @returns {Promise<{ts: number|null, why: string|null, from: string}>}
    */
   async function loadUploadDoc(mid) {
-    // 先看缓存，避免重复解析同一 mid
-    if (resultCache.has(mid)) {
-      return resultCache.get(mid);
+    // 1. 本地持久缓存优先：完全不再请求 iframe
+    if (persistentCache[mid]) {
+      const ts = persistentCache[mid];
+      return { ts, why: null, from: 'persistent' };
     }
 
-    // 保证只会串行地使用 iframe
+    // 2. 运行时缓存（本页已经查过）
+    if (runtimeCache.has(mid)) {
+      const r = runtimeCache.get(mid);
+
+      // A. 有成功时间戳 → 直接用
+      if (r.ts) {
+        return { ts: r.ts, why: null, from: 'runtime' };
+      }
+
+      // B. 无 ts 且为“可重试错误” → 允许本次重新请求
+      if (RETRYABLE_ERRORS.has(r.why)) {
+        log(
+          '检测到可重试错误，mid =',
+          mid,
+          'why =',
+          r.why,
+          '，本次将重新尝试加载。'
+        );
+        // 不 return，继续往下执行，重新加载 iframe
+      } else {
+        // C. 风控之类的“硬错误” → 直接返回缓存
+        return { ts: null, why: r.why, from: 'runtime' };
+      }
+    }
+
+    // 3. 若已经全局标记为风控阻断，不再发请求
+    if (riskBlocked) {
+      const why = 'risk_blocked';
+      setRuntimeCache(mid, null, why);
+      return { ts: null, why, from: 'blocked' };
+    }
+
+    // 4. 真正通过 iframe 串行加载 /upload/video
+    // 保证只有一个 mid 在占用 iframe
     while (iframeBusy) {
       await sleep(200);
     }
@@ -199,7 +314,7 @@
     const url = `https://space.bilibili.com/${mid}/upload/video`;
     log('加载 upload/video 页面:', url);
 
-    const result = { ts: null, why: null };
+    let result = { ts: null, why: null };
 
     try {
       const doc = await new Promise((resolve, reject) => {
@@ -240,14 +355,24 @@
         iframe.src = url;
       });
 
-      // 解析 iframe 文档中的视频时间列表，返回最新一条的时间戳
-      const ts = parseLastVideoTimeFromDoc(doc);
-      if (!ts) {
+      // 先检查是否为 412 风控页面
+      if (isRiskBlockedDoc(doc)) {
+        log('检测到 B 站 412 风控页面，停止后续请求。');
+        riskBlocked = true;
         result.ts = null;
-        result.why = 'parse_failed';
+        result.why = 'risk_page_412';
       } else {
-        result.ts = ts;
-        result.why = null;
+        // 正常解析 upload/video 页面视频时间
+        const ts = parseLastVideoTimeFromDoc(doc);
+        if (!ts) {
+          result.ts = null;
+          result.why = 'parse_failed';
+        } else {
+          result.ts = ts;
+          result.why = null;
+          // 成功结果写入本地持久缓存
+          setPersistentCache(mid, ts);
+        }
       }
     } catch (e) {
       console.error('[LastVideo iframe] 加载 upload 页面失败 mid=', mid, e);
@@ -255,13 +380,13 @@
       result.why = e && e.message ? e.message : 'load_error';
     } finally {
       iframeBusy = false;
-      // 写入缓存
-      resultCache.set(mid, result);
+      // 写入运行时缓存
+      setRuntimeCache(mid, result.ts, result.why);
       // 两个 UP 之间插入间隔，防止频率过高
       await sleep(LOAD_INTERVAL);
     }
 
-    return result;
+    return { ts: result.ts, why: result.why, from: 'iframe' };
   }
 
   /**
@@ -310,7 +435,6 @@
    * ========================= 关注页 DOM 处理 =========================
    */
 
-  // 在关注卡片中为每个 UP 添加一行“最近投稿：xxx”
   function ensureInfoLine(link) {
     const card =
       link.closest('.relation-card') ||
@@ -331,16 +455,13 @@
     return line;
   }
 
-  // 从关注页的个人空间链接中抽取 mid
   function extractMidFromLink(link) {
     const href = link.href || link.getAttribute('href') || '';
-    // 典型形式: https://space.bilibili.com/3537120496978247?spm_xxx
     const m = href.match(/space\.bilibili\.com\/(\d+)(?=[\/\?]|$)/);
     if (!m) return null;
     return m[1];
   }
 
-  // 处理单个关注项
   async function processLink(link, idx, total) {
     const mid = extractMidFromLink(link);
     if (!mid) {
@@ -350,54 +471,73 @@
 
     const line = ensureInfoLine(link);
 
-    // 若已有缓存，先展示缓存结果，再异步刷新
-    if (resultCache.has(mid)) {
-      const cached = resultCache.get(mid);
-      if (cached.ts) {
-        const diff = formatDiff(cached.ts);
-        const exact = new Date(cached.ts).toLocaleString();
-        line.textContent = `最近投稿：${diff}（${exact}，缓存）`;
-      } else {
-        line.textContent = '最近投稿：无记录（缓存）';
-      }
+    // 先尝试使用本地缓存（持久 + 运行时）
+    const cached = getCached(mid);
+    if (cached && cached.ts) {
+      const diff = formatDiff(cached.ts);
+      const exact = new Date(cached.ts).toLocaleString();
+      const suffix =
+        cached.source === 'persistent'
+          ? '（本地缓存）'
+          : '（缓存）';
+      line.textContent = `最近投稿：${diff}（${exact}）${suffix}`;
+    } else if (cached && !cached.ts) {
+      line.textContent = '最近投稿：无记录（缓存）';
     } else {
       line.textContent = `最近投稿：加载中 (${idx + 1}/${total})…`;
     }
 
-    const { ts, why } = await loadUploadDoc(mid);
+    // 然后再去真正加载（如果已有持久缓存 / 已被 riskBlocked，会在内部直接返回，不再发起请求）
+    const { ts, why, from } = await loadUploadDoc(mid);
 
     if (!ts) {
       if (why === 'parse_failed') {
-        line.textContent = '最近投稿：解析失败';
+        line.textContent = '最近投稿：解析失败（稍后将自动重试）';
       } else if (why === 'iframe_timeout') {
-        line.textContent = '最近投稿：页面加载超时';
+        line.textContent = '最近投稿：页面加载超时（稍后将自动重试）';
       } else if (why === 'iframe_onerror') {
-        line.textContent = '最近投稿：页面错误';
+        line.textContent = '最近投稿：页面错误（稍后将自动重试）';
+      } else if (why === 'risk_page_412' || why === 'risk_blocked') {
+        line.textContent = '最近投稿：接口风控，本页不再继续请求';
+      } else if (why === 'load_error') {
+        line.textContent = '最近投稿：页面加载失败（稍后将自动重试）';
       } else {
-        line.textContent = `最近投稿：无法获取(${why || 'unknown'})`;
+        // 如果是来自 persistent/runtime 且 ts 为 null，也已经在上面显示“缓存无记录”
+        if (!cached || (cached && cached.ts)) {
+          line.textContent = `最近投稿：无法获取(${why || 'unknown'})`;
+        }
       }
     } else {
       const diff = formatDiff(ts);
       const exact = new Date(ts).toLocaleString();
-      line.textContent = `最近投稿：${diff}（${exact}）`;
+      const suffix =
+        from === 'persistent'
+          ? '（本地缓存）'
+          : from === 'runtime'
+          ? '（缓存）'
+          : '';
+      line.textContent = `最近投稿：${diff}（${exact}）${suffix}`;
     }
   }
 
-  // 扫描当前页所有关注的 UP，并串行处理
   async function scanAllLinks() {
-    const links = Array.from(document.querySelectorAll('a.relation-card-info__uname'));
-    infoSpan.textContent = ' | 本次扫描UP数：' + links.length;
-    log('关注页扫描到 UP 数 =', links.length);
+    const links = Array.from(
+      document.querySelectorAll('a.relation-card-info__uname')
+    );
+    infoSpan.textContent =
+      ' | 本次扫描UP数：' +
+      links.length +
+      (riskBlocked ? '（已检测到风控，仅使用缓存）' : '');
+    log('关注页扫描到 UP 数 =', links.length, 'riskBlocked =', riskBlocked);
 
     let i = 0;
     for (const link of links) {
       await processLink(link, i, links.length);
       i++;
-      // 间隔逻辑已在 loadUploadDoc 中实现，这里无需再额外 sleep
+      // 间隔逻辑已在 loadUploadDoc 内部处理，这里不再额外 sleep
     }
   }
 
-  // 简单的防抖封装：避免 MutationObserver 高频触发时重复扫描
   function debounce(fn, delay) {
     let timer = null;
     return function (...args) {
