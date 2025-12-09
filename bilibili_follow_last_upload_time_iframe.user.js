@@ -1,12 +1,12 @@
 // ==UserScript==
-// @name         Bilibili Follow Page - Last Upload Time (iframe+cache+risk)
+// @name         Bilibili Follow Page - Last Upload Time (iframe+runtime-cache+risk)
 // @namespace    https://github.com/ShineMinxing/BrowserJavaScript
-// @version      1.2.0
+// @version      1.3.0
 // @author       ShineMinxing
-// @description  在 B站关注页（/relation/follow）下方显示每个关注UP主最近一次投稿的时间（iframe 版，带本地缓存、解析失败重试与风险识别）。
+// @description  在 B站关注页（/relation/follow）下方显示每个关注UP主最近一次投稿的时间（iframe 版，仅运行时缓存、解析失败可重试与风险识别）。
 // @description:zh-CN 在 B站关注页（/relation/follow）下方显示每个关注UP主最近一次投稿的时间。
 //               通过隐藏 iframe 顺序打开各UP的 /upload/video 页面，从页面 DOM 中解析投稿时间，避免接口风控与 CORS 限制。
-//               使用 localStorage + 运行时缓存避免重复访问，同步检测 412 风控页面，触发后停止进一步请求。
+//               使用运行时缓存避免重复访问，一旦关闭页面/浏览器即自动清空；同步检测 412 风控页面，触发后停止进一步请求。
 // @match        https://space.bilibili.com/*/relation/follow*
 // @run-at       document-end
 // @grant        none
@@ -29,16 +29,13 @@
   // 是否输出调试日志到控制台（F12 -> Console）
   const DEBUG = true;
 
-  // 本地持久缓存 key（只保存“成功解析”的时间戳）
-  const LS_KEY = 'biliLastVideoIframeCache_v1';
-
   /**
    * ========================= 顶部调试条 =========================
    * 仅作为脚本运行状态与简单统计的可视化提示。
    */
 
   const banner = document.createElement('div');
-  banner.textContent = '【LastVideo iframe v1.2】';
+  banner.textContent = '【LastVideo iframe v1.3】';
   Object.assign(banner.style, {
     position: 'fixed',
     top: '0',
@@ -181,40 +178,14 @@
 
   /**
    * ========================= 缓存管理 =========================
+   * 仅运行时缓存：Tab 关闭或刷新后自动清空。
    */
 
   // 运行时缓存：mid -> { ts: number|null, why: string|null }
   const runtimeCache = new Map();
 
-  function loadPersistentCache() {
-    try {
-      const raw = localStorage.getItem(LS_KEY);
-      if (!raw) return {};
-      const obj = JSON.parse(raw);
-      if (obj && typeof obj === 'object') return obj;
-      return {};
-    } catch (e) {
-      log('解析本地缓存失败', e);
-      return {};
-    }
-  }
-
-  function savePersistentCache(obj) {
-    try {
-      localStorage.setItem(LS_KEY, JSON.stringify(obj));
-    } catch (e) {
-      log('写入本地缓存失败', e);
-    }
-  }
-
-  // 持久缓存：mid -> ts(毫秒)
-  const persistentCache = loadPersistentCache();
-
-  // 从两级缓存中读取数据
+  // 从运行时缓存中读取数据
   function getCached(mid) {
-    if (persistentCache[mid]) {
-      return { ts: persistentCache[mid], why: null, source: 'persistent' };
-    }
     if (runtimeCache.has(mid)) {
       const r = runtimeCache.get(mid);
       return { ts: r.ts, why: r.why, source: 'runtime' };
@@ -225,12 +196,6 @@
   // 写运行时缓存
   function setRuntimeCache(mid, ts, why) {
     runtimeCache.set(mid, { ts, why: why || null });
-  }
-
-  // 写持久缓存（只存成功 ts）
-  function setPersistentCache(mid, ts) {
-    persistentCache[mid] = ts;
-    savePersistentCache(persistentCache);
   }
 
   /**
@@ -260,19 +225,13 @@
 
   /**
    * 加载单个 UP 的 upload/video 页面，并解析出最近一次投稿时间。
-   * 会优先使用本地缓存（持久 + 运行时），只有在没有缓存且未被标记 riskBlocked 时，才真正发起 iframe 加载。
+   * 会优先使用运行时缓存；只有在没有缓存且未被标记 riskBlocked 时，才真正发起 iframe 加载。
    * 对于“解析失败/超时”这类软错误，会在下一次扫描时重试。
    * @param {string} mid - UP 主的 mid
    * @returns {Promise<{ts: number|null, why: string|null, from: string}>}
    */
   async function loadUploadDoc(mid) {
-    // 1. 本地持久缓存优先：完全不再请求 iframe
-    if (persistentCache[mid]) {
-      const ts = persistentCache[mid];
-      return { ts, why: null, from: 'persistent' };
-    }
-
-    // 2. 运行时缓存（本页已经查过）
+    // 1. 运行时缓存（本页已经查过）
     if (runtimeCache.has(mid)) {
       const r = runtimeCache.get(mid);
 
@@ -297,14 +256,14 @@
       }
     }
 
-    // 3. 若已经全局标记为风控阻断，不再发请求
+    // 2. 若已经全局标记为风控阻断，不再发请求
     if (riskBlocked) {
       const why = 'risk_blocked';
       setRuntimeCache(mid, null, why);
       return { ts: null, why, from: 'blocked' };
     }
 
-    // 4. 真正通过 iframe 串行加载 /upload/video
+    // 3. 真正通过 iframe 串行加载 /upload/video
     // 保证只有一个 mid 在占用 iframe
     while (iframeBusy) {
       await sleep(200);
@@ -370,8 +329,6 @@
         } else {
           result.ts = ts;
           result.why = null;
-          // 成功结果写入本地持久缓存
-          setPersistentCache(mid, ts);
         }
       }
     } catch (e) {
@@ -471,23 +428,19 @@
 
     const line = ensureInfoLine(link);
 
-    // 先尝试使用本地缓存（持久 + 运行时）
+    // 先尝试使用运行时缓存
     const cached = getCached(mid);
     if (cached && cached.ts) {
       const diff = formatDiff(cached.ts);
       const exact = new Date(cached.ts).toLocaleString();
-      const suffix =
-        cached.source === 'persistent'
-          ? '（本地缓存）'
-          : '（缓存）';
-      line.textContent = `最近投稿：${diff}（${exact}）${suffix}`;
+      line.textContent = `最近投稿：${diff}（${exact}）（缓存）`;
     } else if (cached && !cached.ts) {
       line.textContent = '最近投稿：无记录（缓存）';
     } else {
       line.textContent = `最近投稿：加载中 (${idx + 1}/${total})…`;
     }
 
-    // 然后再去真正加载（如果已有持久缓存 / 已被 riskBlocked，会在内部直接返回，不再发起请求）
+    // 然后再去真正加载（如果缓存中已有成功结果 / 已被 riskBlocked，会在内部直接返回，不再发起请求）
     const { ts, why, from } = await loadUploadDoc(mid);
 
     if (!ts) {
@@ -502,7 +455,7 @@
       } else if (why === 'load_error') {
         line.textContent = '最近投稿：页面加载失败（稍后将自动重试）';
       } else {
-        // 如果是来自 persistent/runtime 且 ts 为 null，也已经在上面显示“缓存无记录”
+        // 如果 cached 存在且 ts 为 null，上面已经显示“缓存无记录”
         if (!cached || (cached && cached.ts)) {
           line.textContent = `最近投稿：无法获取(${why || 'unknown'})`;
         }
@@ -511,9 +464,7 @@
       const diff = formatDiff(ts);
       const exact = new Date(ts).toLocaleString();
       const suffix =
-        from === 'persistent'
-          ? '（本地缓存）'
-          : from === 'runtime'
+        from === 'runtime'
           ? '（缓存）'
           : '';
       line.textContent = `最近投稿：${diff}（${exact}）${suffix}`;
